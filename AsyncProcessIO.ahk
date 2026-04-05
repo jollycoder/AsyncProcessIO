@@ -1,4 +1,4 @@
-﻿#Requires AutoHotkey v2
+#Requires AutoHotkey v2
 #Include AsyncWait.ahk
 
 ; =============================================================================
@@ -42,8 +42,10 @@ class AsyncProcessIO
         this._startTime := A_TickCount
         if IsSet(callback)
             this._callback := callback
-        if IsSet(timeout)
+        if IsSet(timeout) {
             this._timeout  := timeout
+            this._timeoutFired := false
+        }
 
         ; Accumulation buffers (no-callback mode)
         this._outData := raw ? Buffer(AsyncProcessIO.BUF_STDOUT_SIZE) : ''
@@ -145,9 +147,7 @@ class AsyncProcessIO
             this._errData .= data
     }
 
-    ; Handle a timeout from one stream. The silence timer is shared across both
-    ; streams: any data on either stream resets _startTime. If the other stream
-    ; is still active, re-register with a full timeout instead of firing.
+    ; Handle a timeout from one stream
     _handleTimeout(stream) {
         reader := stream = 0 ? this._stdout : this._stderr
         if this.HasProp('_timeout') {
@@ -157,11 +157,11 @@ class AsyncProcessIO
                 return
             }
         }
-        otherDone := stream = 0 ? this._stderr.complete : this._stdout.complete
-        if !otherDone && this.HasProp('_timeout') {
-            reader._registerWait(this._timeout)
+        if this._timeoutFired
             return
-        }
+        this._timeoutFired := true
+        this._stdout._cancelTimeout()
+        this._stderr._cancelTimeout()
         if this.HasProp('_callback') {
             emptyData := (stream = 0 && this._raw) ? Buffer(0) : ''
             SetTimer(this._callback.Bind(this.process.PID, emptyData, -1, stream), -10)
@@ -552,6 +552,18 @@ class StreamReader
         SetTimer(this._callback.Bind(batch, done ? 1 : 0), -10)
         if !done
             this._registerWait()
+    }
+
+    ; -------------------------------------------------------------------------
+    ; Cancel by timeout
+    ; -------------------------------------------------------------------------
+
+    _cancelTimeout() {
+        if this._complete
+            return
+        SetTimer(this._watchdogFn, 0)
+        DllCall('CancelIoEx', 'Ptr', this._hPipe, 'Ptr', this._overlapped)
+        DllCall('SetEvent', 'Ptr', this._hEvent)
     }
 
     ; -------------------------------------------------------------------------
