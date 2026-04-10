@@ -9,6 +9,7 @@
 ;
 ; Version: 1.0.0
 ; Date:    2026-04-10
+; Forum:   https://www.autohotkey.com/boards/viewtopic.php?f=83&t=122732
 ; =============================================================================
 
 class AsyncProcessIO
