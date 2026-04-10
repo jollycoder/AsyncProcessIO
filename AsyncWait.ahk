@@ -19,6 +19,9 @@ class AsyncWait
      *     Semaphores, mutexes (wait for release)
      *
      * Based on lexikos's code: https://www.autohotkey.com/boards/viewtopic.php?t=110691
+     * 
+     * Version: 1.0.0
+     * Date:    2026-04-10
      */
 
     static WT_EXECUTEDEFAULT      := 0x00000000

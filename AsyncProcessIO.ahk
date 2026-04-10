@@ -6,6 +6,9 @@
 ; AsyncStdinReader — read inherited stdin asynchronously in a child process.
 ; StreamReader     — shared engine for async pipe reading (used by both above).
 ; AsyncWait        — thread-pool wait → GUI thread marshalling via PostMessageW.
+;
+; Version: 1.0.0
+; Date:    2026-04-10
 ; =============================================================================
 
 class AsyncProcessIO
