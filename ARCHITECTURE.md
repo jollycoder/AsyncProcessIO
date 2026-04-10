@@ -144,3 +144,36 @@ Pipe names include `A_TickCount` for uniqueness across time. A static counter `_
 `CreateProcess` returns `hProcess` and `hThread` in `PROCESS_INFORMATION`. These must be explicitly closed — they are kernel handles with reference-counted lifetime. The original code only extracted `dwProcessId` and let the `PROCESS_INFORMATION` buffer go out of scope, leaking two handles per process launch. This was a constant leak (~few KB per run), independent of data volume.
 
 `ProcessClose(pid)` in `__Delete` does NOT fix this: it opens a new handle via `OpenProcess`, terminates the process, and closes its own handle — the original handles from `CreateProcess` remain leaked.
+
+## Callback re-entrancy under heavy I/O
+
+Each data chunk is delivered to the user callback via `SetTimer(..., -10)`. Under heavy I/O,
+multiple `SetTimer` calls may be queued before the first one executes. When the first callback
+runs, it pumps the AHK message loop internally (e.g. via `SendMessage` for `EditPaste`, or via
+`Sleep`). This allows a queued callback to fire before the first one has returned — re-entrant
+execution of the same callback function.
+
+This is harmless for stateless callbacks (simple GUI updates, logging). But if the callback
+maintains state across calls — a carry buffer for incomplete lines, counters, accumulators —
+re-entrant execution corrupts that state: the second call sees the carry from the middle of the
+first call's processing.
+
+**Solution:** Serialize execution with an in-memory queue:
+
+```ahk
+OnData(pid, str, state, stream) {
+    static queue := []
+    queue.Push({str: str, state: state, stream: stream})
+    if queue.Length > 1
+        return  ; re-entrant call — will be processed by the active loop
+    while queue.Length {
+        item := queue[1]
+        _processChunk(item.str, item.state, item.stream)
+        queue.RemoveAt(1)
+    }
+}
+```
+
+The active call drains the queue to completion before returning. Re-entrant calls push to the
+queue and return immediately — their data is processed in order by the already-active loop.
+This pattern is only needed when the callback maintains mutable state shared across calls.

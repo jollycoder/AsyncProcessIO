@@ -39,17 +39,19 @@ Copy both files to your project and include the one you need:
 ### Accumulation mode — collect all output
 
 ```ahk
-#Include AsyncProcessIO.ahk
+#Include <AsyncProcessIO>
 
 proc := AsyncProcessIO('ping google.com')
 
 ; Wait for both streams to complete
-while !proc.complete
+while !proc.complete {
     Sleep 50
-
-MsgBox 'stdout: ' . proc.outSize . ' bytes' . '`n'
-     . 'stderr: ' . proc.errSize . ' bytes' . '`n`n'
-     . proc.outData
+}
+Sleep 50
+state := Map(0, 'running', 1, 'completed', -1, 'timed out')[proc.state]
+MsgBox 'state: '    . state        . '`n`n'
+     . 'outData:`n' . proc.outData . '`n`n'
+     . 'outSize: '  . proc.outSize
 ```
 
 ### Callback mode — process data as it arrives
@@ -97,6 +99,7 @@ Demonstrates transferring a binary file through a pipe. The child script reads t
 
 **`parent.ahk`:**
 ```ahk
+#Requires AutoHotkey v2
 #Include AsyncProcessIO.ahk
 Persistent
 
@@ -120,6 +123,8 @@ OnChunk(pid, buf, state, stream) {
 
 **`child.ahk`:**
 ```ahk
+#Requires AutoHotkey v2
+
 buf := FileRead(A_Args[1], 'RAW')
 stdout := FileOpen('*', 'w')
 stdout.RawWrite(buf)
@@ -131,6 +136,7 @@ stdout.Close()
 The timeout is a shared silence timer across both stdout and stderr. It fires if neither stream delivers data for the specified number of milliseconds.
 
 ```ahk
+#Requires AutoHotkey v2
 #Include AsyncProcessIO.ahk
 Persistent
 
@@ -193,7 +199,7 @@ proc := AsyncProcessIO(cmd, callback?, timeout?, encoding?, raw?, stdinOverlappe
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `cmd` | String | — | Command line to execute |
-| `callback` | Func | — | Called on each data chunk. When omitted, data is accumulated in outData / errData instead and can be read after complete is true. |
+| `callback` | Func | — | Called on each data chunk; omit to use accumulation mode |
 | `timeout` | Integer | — | Silence timeout in ms; omit for no timeout |
 | `encoding` | String | system OEM | Text encoding, e.g. `'utf-8'`, `'cp1252'` |
 | `raw` | Boolean | `false` | Deliver stdout as `Buffer` instead of string |
@@ -214,6 +220,9 @@ callback(pid, data, state, stream)
 |----------|-------------|
 | `proc.processID` | Child process ID |
 | `proc.complete` | `true` when both stdout and stderr are fully drained |
+| `proc.state` | Aggregate completion state: `0` running, `1` both streams reached EOF, `-1` at least one timed out |
+| `proc.outState` | stdout completion state: `0` running, `1` EOF, `-1` timed out |
+| `proc.errState` | stderr completion state: `0` running, `1` EOF, `-1` timed out |
 | `proc.outData` | Accumulated stdout (text mode: String, raw mode: Buffer) |
 | `proc.errData` | Accumulated stderr (always String) |
 | `proc.outSize` | Byte count (raw) or string length (text) of accumulated stdout |
