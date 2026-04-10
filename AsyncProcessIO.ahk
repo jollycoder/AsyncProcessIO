@@ -350,6 +350,9 @@ class AsyncStdinReader
      *         state — 0 (data incoming), 1 (EOF)
      * encoding: text encoding for StrGet; defaults to system OEM codepage.
      * raw:      deliver raw Buffer objects instead of decoded strings.
+     * 
+     * Version: 1.0.0
+     * Date:    2026-04-10
      */
 
     static BUF_STDIN_SIZE := 0x10000
