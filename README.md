@@ -39,7 +39,7 @@ Copy both files to your project and include the one you need:
 ### Accumulation mode — collect all output
 
 ```ahk
-#Include <AsyncProcessIO>
+#Include AsyncProcessIO.ahk
 
 proc := AsyncProcessIO('ping google.com')
 
