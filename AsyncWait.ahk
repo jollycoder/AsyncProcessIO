@@ -18,10 +18,23 @@ class AsyncWait
      *     Process/thread handles (wait for exit)
      *     Semaphores, mutexes (wait for release)
      *
+     * Lifetime model:
+     *     Every registration gets a unique, never reused integer id. The thread-pool
+     *     thunk posts only that id (wParam) and reads nothing but constants baked
+     *     into its own code, so it never touches AHK-managed memory. The AHK side
+     *     resolves the id through the _active map; a message that arrives after
+     *     Unregister() (or after the object is gone) is simply ignored.
+     *     The map holds a strong reference while the wait is registered, so the
+     *     caller does not have to keep the returned object alive. A one-shot wait
+     *     (WT_EXECUTEONLYONCE) is dropped from the map once delivered; any other
+     *     wait stays there until Unregister() is called.
+     *
      * Based on lexikos's code: https://www.autohotkey.com/boards/viewtopic.php?t=110691
-     * 
-     * Version: 1.0.0
-     * Date:    2026-04-10
+     *
+     * Version: 1.1.0
+     * Date:    2026-09-22
+     *     1.1.0 — fix use-after-free when a posted message outlived its
+     *             RegisteredWait (crash in _messaged on resume from sleep).
      */
 
     static WT_EXECUTEDEFAULT      := 0x00000000
@@ -32,102 +45,131 @@ class AsyncWait
          , WM_ASYNCWAIT_CALLBACK  := 0x5743
 
          , _inited := false
+         , _nextId := 0
+         , _active := Map()
 
     static Register(handle, callback, flags := this.WT_EXECUTEONLYONCE, timeout := -1, completionEvent := -1) {
         this._init()
-        param := this.RegisteredWait(handle, callback)
-        NumPut('Ptr', this._postMessageW, 'Ptr', this._wnd.hwnd,
-               'Ptr', this._nmsg, param)
-        NumPut('Ptr', ObjPtr(param), param, A_PtrSize * 3)
-
+        id := ++this._nextId
+        rw := this.RegisteredWait(id, handle, callback, flags, completionEvent)
+        ; Publish before registering: the message cannot be dispatched until this
+        ; thread pumps, but keeping the map authoritative from the start is simpler.
+        this._active[id] := rw
         if !DllCall('RegisterWaitForSingleObject',
                     'Ptr*', &wh := 0, 'Ptr', handle,
-                    'Ptr',  this._waitCallback, 'Ptr', param,
-                    'UInt', timeout, 'UInt', flags)
-            throw OSError()
-
-        param.waitHandle := wh
-        ; Intentional self-addref: keeps `param` alive while it lives in the
-        ; system thread-pool queue, where AHK's GC cannot see it.
-        ; Released in _unlock() after the callback is delivered.
-        param.locked := ObjPtrAddRef(param)
-        param.completionEvent := completionEvent
-        return param
+                    'Ptr',  this._waitCallback, 'Ptr', id,
+                    'UInt', timeout, 'UInt', flags) {
+            err := A_LastError
+            this._active.Delete(id)
+            rw.callback := ''
+            throw OSError(err)
+        }
+        rw.waitHandle := wh
+        return rw
     }
 
     static _init() {
-        static PAGE_EXECUTE_READWRITE := 0x40, HWND_MESSAGE := -3
+        static HWND_MESSAGE := -3
         if this._inited
             return
-        /**
-         * #include <windows.h>
-         * struct Param {
-         *     decltype(&PostMessageW) pm;
-         *     HWND wnd;
-         *     UINT msg;
-         * };
-         * VOID CALLBACK WaitCallback(Param *param, BOOLEAN waitFired) {
-         *     param->pm(param->wnd, param->msg, (WPARAM)param, (LPARAM)waitFired);
-         * }
-         * ---- 64-bit
-         * 00000	48 8b c1		 mov	 rax, rcx
-         * 00003	44 0f b6 ca		 movzx	 r9d, dl
-         * 00007	8b 51 10		 mov	 edx, DWORD PTR [rcx+16]
-         * 0000a	4c 8b c1		 mov	 r8, rcx
-         * 0000d	48 8b 49 08		 mov	 rcx, QWORD PTR [rcx+8]
-         * 00011	48 ff 20		 rex_jmp QWORD PTR [rax]
-         * ---- 32-bit
-         * 00000	0f b6 44 24 08	 movzx	 eax, BYTE PTR _waitFired$[esp-4]
-         * 00005	50				 push	 eax
-         * 00006	8b 44 24 08		 mov	 eax, DWORD PTR _param$[esp]
-         * 0000a	50				 push	 eax
-         * 0000b	ff 70 08		 push	 DWORD PTR [eax+8]
-         * 0000e	ff 70 04		 push	 DWORD PTR [eax+4]
-         * 00011	8b 00			 mov	 eax, DWORD PTR [eax]
-         * 00013	ff d0			 call	 eax
-         * 00015	c2 08 00		 ret	 8
-         */
-        a := A_PtrSize = 8 ? 0x8BCAB60F44C18B48 : 0x448B50082444B60F
-        b := A_PtrSize = 8 ? 0x498B48C18B4C1051 : 0x70FF0870FF500824
-        c := A_PtrSize = 8 ? 0x0000000020FF4808 : 0x0008C2D0FF008B04
-        NumPut('Int64', a, 'Int64', b, 'Int64', c, this._waitCallback := Buffer(24))
-        DllCall('VirtualProtect', 'Ptr', this._waitCallback, 'Ptr', 24,
-                                  'UInt', PAGE_EXECUTE_READWRITE, 'UInt*', 0)
-        hLib := DllCall('GetModuleHandle', 'Str', 'user32', 'Ptr')
-        this._postMessageW := DllCall('GetProcAddress', 'Ptr', hLib, 'AStr', 'PostMessageW', 'Ptr')
-
         this._wnd  := Gui()
         DllCall('SetParent', 'Ptr', this._wnd.hwnd, 'Ptr', HWND_MESSAGE)
         this._nmsg := AsyncWait.WM_ASYNCWAIT_CALLBACK
+        hLib := DllCall('GetModuleHandle', 'Str', 'user32', 'Ptr')
+        pm   := DllCall('GetProcAddress', 'Ptr', hLib, 'AStr', 'PostMessageW', 'Ptr')
+        this._waitCallback := this._buildThunk(pm, this._wnd.hwnd, this._nmsg)
         OnMessage(this._nmsg, ObjBindMethod(this, '_messaged'), 255)
         this._inited := true
     }
 
-    static _messaged(wParam, lParam, nmsg, hwnd) {
-        if hwnd = this._wnd.hwnd {
-            param := ObjFromPtrAddRef(NumGet(wParam + A_PtrSize * 3, 'Ptr'))
-            try (param.callback)(param.handle, lParam)
-            (param.locked) && param._unlock()
+    /**
+     * Builds the WAITORTIMERCALLBACK thunk with PostMessageW, hwnd and msg
+     * embedded as immediates. Context carries the registration id.
+     *
+     * VOID CALLBACK WaitCallback(PVOID id, BOOLEAN waitFired) {
+     *     PostMessageW(HWND_CONST, MSG_CONST, (WPARAM)id, (LPARAM)waitFired);
+     * }
+     * ---- 64-bit (tail call, caller's shadow space is reused)
+     * 00  44 0F B6 CA        movzx r9d, dl        ; lParam = waitFired
+     * 04  4C 8B C1           mov   r8, rcx        ; wParam = id
+     * 07  BA imm32           mov   edx, msg
+     * 0C  48 B9 imm64        mov   rcx, hwnd
+     * 16  48 B8 imm64        mov   rax, PostMessageW
+     * 20  FF E0              jmp   rax
+     * ---- 32-bit (stdcall)
+     * 00  0F B6 44 24 08     movzx eax, byte [esp+8]  ; waitFired
+     * 05  50                 push  eax                ; lParam
+     * 06  FF 74 24 08        push  dword [esp+8]      ; wParam = id
+     * 0A  68 imm32           push  msg
+     * 0F  68 imm32           push  hwnd
+     * 14  B8 imm32           mov   eax, PostMessageW
+     * 19  FF D0              call  eax
+     * 1B  C2 08 00           ret   8
+     *
+     * The code block is allocated once and never freed: a thread-pool callback
+     * may still be executing it after UnregisterWaitEx(wh, NULL) returns.
+     */
+    static _buildThunk(pm, hwnd, msg) {
+        static MEM_COMMIT := 0x1000, MEM_RESERVE := 0x2000
+             , PAGE_READWRITE := 0x04, PAGE_EXECUTE_READ := 0x20
+        if A_PtrSize = 8 {
+            hex  := '440FB6CA' . '4C8BC1' . 'BA00000000'
+                  . '48B90000000000000000' . '48B80000000000000000' . 'FFE0'
+            imms := [[0x08, 'UInt', msg], [0x0E, 'Ptr', hwnd], [0x18, 'Ptr', pm]]
+        } else {
+            hex  := '0FB6442408' . '50' . 'FF742408'
+                  . '6800000000' . '6800000000' . 'B800000000' . 'FFD0' . 'C20800'
+            imms := [[0x0B, 'UInt', msg], [0x10, 'Ptr', hwnd], [0x15, 'Ptr', pm]]
         }
+        size := StrLen(hex) // 2
+        p := DllCall('VirtualAlloc', 'Ptr', 0, 'Ptr', size,
+                     'UInt', MEM_COMMIT | MEM_RESERVE, 'UInt', PAGE_READWRITE, 'Ptr')
+        if !p
+            throw OSError()
+        loop size
+            NumPut('UChar', Integer('0x' . SubStr(hex, A_Index * 2 - 1, 2)), p, A_Index - 1)
+        for imm in imms
+            NumPut(imm[2], imm[3], p, imm[1])
+        DllCall('VirtualProtect', 'Ptr', p, 'Ptr', size, 'UInt', PAGE_EXECUTE_READ, 'UInt*', 0)
+        DllCall('FlushInstructionCache', 'Ptr', DllCall('GetCurrentProcess', 'Ptr'), 'Ptr', p, 'Ptr', size)
+        return p
+    }
+
+    static _messaged(wParam, lParam, nmsg, hwnd) {
+        if hwnd != this._wnd.hwnd
+            return
+        ; Stale message: the wait was unregistered after the callback had
+        ; already posted. Nothing to deliver, and nothing unsafe was read.
+        if !this._active.Has(wParam)
+            return 0
+        rw := this._active[wParam]
+        if rw.flags & this.WT_EXECUTEONLYONCE
+            this._active.Delete(wParam)
+        try (rw.callback)(rw.handle, lParam)
+        return 0
     }
 
     ; -------------------------------------------------------------------------
-    class RegisteredWait extends Buffer {
-        static prototype.waitHandle := 0, prototype.locked := 0, prototype.completionEvent := -1
+    class RegisteredWait {
+        static prototype.waitHandle := 0
 
-        __New(handle, callback) {
-            super.__New(A_PtrSize * 5, 0)
-            this.handle   := handle
-            this.callback := callback
+        __New(id, handle, callback, flags, completionEvent) {
+            this.id              := id
+            this.handle          := handle
+            this.callback        := callback
+            this.flags           := flags
+            this.completionEvent := completionEvent
         }
 
         __Delete() => this.Unregister()
-        _unlock()  => (p := this.locked) && (this.locked := 0, ObjRelease(p))
 
         Unregister() {
             wh := this.waitHandle, this.waitHandle := 0
+            ; Any message still queued for this id will be ignored from now on.
+            if AsyncWait._active.Has(this.id)
+                AsyncWait._active.Delete(this.id)
             (wh) && DllCall('UnregisterWaitEx', 'Ptr', wh, 'Ptr', this.completionEvent)
-            this._unlock(), this.callback := ''
+            this.callback := ''
         }
     }
 }

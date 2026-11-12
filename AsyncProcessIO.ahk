@@ -39,6 +39,7 @@ class AsyncProcessIO
          , BUF_STDERR_SIZE := 0x01000
 
     __New(cmd, callback?, timeout?, encoding?, raw?, stdinOverlapped := false) {
+        this._ownerRef := {ptr: ObjPtr(this)}
         raw      := raw      ?? false
         encoding := encoding ?? 'cp' . DllCall('GetOEMCP')
         this._raw       := raw
@@ -67,16 +68,19 @@ class AsyncProcessIO
         t := this.HasProp('_timeout') ? this._timeout : -1
         this._stdout := StreamReader(
             this.process.hPipeRead, this.hEvent, stdoutBuf,
-            ObjBindMethod(this, '_streamCallback', 0), encoding, raw, t)
+            ObjBindMethod(AsyncProcessIO, '_DispatchStream', this._ownerRef, 0), encoding, raw, t)
         this._stderr := StreamReader(
             this.process.hPipeReadErr, this.hEventErr, stderrBuf,
-            ObjBindMethod(this, '_streamCallback', 1), encoding, false, t)
+            ObjBindMethod(AsyncProcessIO, '_DispatchStream', this._ownerRef, 1), encoding, false, t)
 
         this._stdout.start()
         this._stderr.start()
     }
 
     processID => this.process.PID
+
+    ; Empty until the child exits; otherwise its unsigned Windows exit code.
+    exitCode => this.process.GetExitCode()
 
     ; True only when both stdout and stderr are fully drained
     complete => this._stdout.complete && this._stderr.complete
@@ -136,7 +140,21 @@ class AsyncProcessIO
 
     ; -------------------------------------------------------------------------
 
-    ; Callback bound to each StreamReader via ObjBindMethod.
+    ; Readers and their queued timers hold only this record, not their owner.
+    ; Pin a live owner before allowing another AHK thread to release it.
+    static _DispatchStream(ownerRef, stream, data, state) {
+        wasCritical := A_IsCritical
+        Critical
+        try {
+            if !ownerRef.ptr
+                return
+            owner := ObjFromPtrAddRef(ownerRef.ptr)
+        } finally {
+            Critical wasCritical
+        }
+        owner._streamCallback(stream, data, state)
+    }
+
     ; Prepends PID and stream index, dispatches to user callback or accumulates.
     _streamCallback(stream, data, state) {
         if state = -1 {
@@ -165,9 +183,7 @@ class AsyncProcessIO
             this._errData .= data
     }
 
-    ; Handle a timeout from one stream. The silence timer is shared across both
-    ; streams: any data on either stream resets _startTime. If the other stream
-    ; is still active, re-register with a full timeout instead of firing.
+    ; The silence timer is shared: activity on either stream resets _startTime.
     _handleTimeout(stream) {
         reader := stream = 0 ? this._stdout : this._stderr
         if this.HasProp('_timeout') {
@@ -176,11 +192,6 @@ class AsyncProcessIO
                 reader._registerWait(remaining)
                 return
             }
-        }
-        otherDone := stream = 0 ? this._stderr.complete : this._stdout.complete
-        if !otherDone && this.HasProp('_timeout') {
-            reader._registerWait(this._timeout)
-            return
         }
         if stream = 0
             this._outState := -1
@@ -210,9 +221,11 @@ class AsyncProcessIO
     }
 
     __Delete() {
+        ; Invalidate queued stream callbacks before cleanup pumps messages.
+        if this.HasProp('_ownerRef')
+            this._ownerRef.ptr := 0
         if !this.HasProp('process')
             return
-        pid := this.process.PID
         ; Cancel both streams simultaneously, then wait once for in-flight
         ; PostMessageW callbacks to arrive and be silenced by the sentinel.
         this._stdout.prepareDelete()
@@ -220,12 +233,12 @@ class AsyncProcessIO
         Sleep 50
         this._stdout.finishDelete()
         this._stderr.finishDelete()
+        this.process.TerminateIfRunning()
         this.process.Clear()
         DllCall('CloseHandle', 'Ptr', this.hEvent)
         DllCall('CloseHandle', 'Ptr', this.hEventErr)
         this._outData := ''
         this._errData := ''
-        ProcessClose(pid)
     }
 
     ; =========================================================================
@@ -319,15 +332,36 @@ class AsyncProcessIO
                 DllCall('CloseHandle', 'Ptr', this.%h%), this.%h% := 0
 
             pid := NumGet(PROCESS_INFORMATION, A_PtrSize * 2, 'UInt')
-            DllCall('CloseHandle', 'Ptr', NumGet(PROCESS_INFORMATION, 0, 'Ptr'))           ; hProcess
+            this.hProcess := NumGet(PROCESS_INFORMATION, 0, 'Ptr')
             DllCall('CloseHandle', 'Ptr', NumGet(PROCESS_INFORMATION, A_PtrSize, 'Ptr'))   ; hThread
             return pid
         }
 
+        GetExitCode() {
+            if !this.HasProp('hProcess') || !this.hProcess
+                return ''
+            if DllCall('WaitForSingleObject', 'Ptr', this.hProcess, 'UInt', 0, 'UInt') != 0
+                return ''
+            exitCode := 0
+            if !DllCall('GetExitCodeProcess', 'Ptr', this.hProcess, 'UInt*', &exitCode)
+                return ''
+            return exitCode
+        }
+
+        TerminateIfRunning() {
+            if this.HasProp('hProcess') && this.hProcess
+                && DllCall('WaitForSingleObject', 'Ptr', this.hProcess, 'UInt', 0, 'UInt') = 0x102
+                DllCall('TerminateProcess', 'Ptr', this.hProcess, 'UInt', 1)
+        }
+
         Clear() {
             for h in ['hPipeRead', 'hPipeReadErr', 'hPipeWrite',
-                      'hErrPipeWrite', 'hInPipeWrite', 'hInPipeRead']
-                (this.%h%) && DllCall('CloseHandle', 'Ptr', this.%h%)
+                      'hErrPipeWrite', 'hInPipeWrite', 'hInPipeRead', 'hProcess'] {
+                if this.HasProp(h) && this.%h% {
+                    DllCall('CloseHandle', 'Ptr', this.%h%)
+                    this.%h% := 0
+                }
+            }
         }
     }
 }
@@ -502,6 +536,10 @@ class StreamReader
         this._watchdogGen := gen
         weakPtr   := ObjPtr(this)
         sentinel  := this._sentinel
+        ; AsyncWait's active map owns pending registrations, including lost messages.
+        ; Replacing our reference alone would leave the previous wait registered.
+        if this.HasProp('_regWait')
+            this._regWait.Unregister()
         this._regWait := AsyncWait.Register(this._hEvent,
             (handle, timedOut) => (
                 sentinel.alive && (

@@ -18,8 +18,8 @@ AHK v2 is single-threaded with a message-pumping event loop. Overlapped I/O comp
 
 1. `ReadFile` with OVERLAPPED → kernel signals `hEvent` when data is ready.
 2. `RegisterWaitForSingleObject` watches `hEvent` from the system thread pool.
-3. Thread-pool callback (a shellcode thunk) calls `PostMessageW` to marshal into the GUI thread.
-4. `OnMessage` handler dispatches to the AHK callback.
+3. Thread-pool callback (a shellcode thunk) calls `PostMessageW`, passing only a stable integer registration ID and the fired/timeout flag. It never dereferences AHK-managed memory.
+4. `OnMessage` resolves the ID through the active-registration map and dispatches to the AHK callback. IDs missing from the map are stale and are ignored.
 
 An alternative is IOCP via `BindIoCompletionCallback` + `SendMessageW` (as in thqby's `child_process`). `SendMessageW` is synchronous and can't lose messages, eliminating the need for watchdog and generation counters. However, it blocks the thread-pool thread until the GUI thread processes the message. The `PostMessageW` approach was chosen to avoid blocking the thread pool, at the cost of needing protective mechanisms described below.
 
@@ -32,6 +32,34 @@ Anonymous pipes (`CreatePipe`) don't support `FILE_FLAG_OVERLAPPED`. Named pipes
 The child's stdin read end must NOT be overlapped. Child processes (cmd.exe, python, powershell) call `ReadFile` with a NULL OVERLAPPED pointer, which is undefined behaviour on an overlapped handle (MSDN KB 156932). The parent's write end is also synchronous — `WriteFile` blocks until the child reads, which is acceptable for interactive input.
 
 ## Protective mechanisms
+
+### Stable registration IDs and delayed-message safety
+
+**Problem (AsyncWait 1.0.0):** The thread-pool thunk received a pointer to an
+AHK `Buffer`, read `PostMessageW` arguments from that buffer, and placed the
+same pointer in `wParam`. `Unregister()` could release the buffer after the
+native callback posted its message but before the GUI thread handled it. The
+message handler would then dereference freed memory. A common trigger was a
+callback queued before sleep and delivered after resume.
+
+**Fix (AsyncWait 1.1.0):** Every registration receives a monotonically
+increasing integer ID. The native thunk has `PostMessageW`, the message-only
+window handle, and the message number embedded as constants; its context is
+only the ID. An `_active` map owns each `RegisteredWait` while registered, and
+the GUI handler resolves the ID through that map. `Unregister()` removes the
+ID before releasing the callback, so a delayed message becomes a no-op instead
+of a use-after-free. One-shot waits are removed immediately before delivery;
+repeating waits remain registered until explicitly cancelled.
+
+The thunk is allocated once and intentionally kept for the process lifetime.
+With `completionEvent = 0`, a thread-pool callback may still be executing after
+`UnregisterWaitEx` returns, so freeing the thunk would recreate the same class
+of lifetime bug at the native-code level.
+
+The active map also means that replacing `StreamReader._regWait` is not enough
+to release an old registration. `_registerWait()` explicitly calls
+`Unregister()` before replacement. This matters when the watchdog recovers a
+lost notification: that notification never removed the previous map entry.
 
 ### Watchdog timer
 
@@ -51,7 +79,7 @@ The 500ms interval is a balance: low enough that a lost message causes only a br
 
 ### Generation counters
 
-**Problem:** When `_registerWait` creates a new `RegisteredWait`, the old one is overwritten and destroyed. But `UnregisterWaitEx` with `completionEvent=0` (NULL) returns immediately — the old thread-pool callback may still be in flight. If it arrives after the new wait is registered, two `_onSignal` calls happen for the same stream, corrupting state (double `ReadFile`, double `GetOverlappedResult`).
+**Problem:** When `_registerWait` replaces a `RegisteredWait`, the old one is explicitly unregistered. But `UnregisterWaitEx` with `completionEvent=0` (NULL) returns immediately — the old thread-pool callback may still be in flight. If a stale reader callback runs after the new wait is registered, two `_onSignal` calls can happen for the same stream, corrupting state (double `ReadFile`, double `GetOverlappedResult`).
 
 **Solution:** Each `_registerWait` bumps `_gen` and captures the current value in the closure. The callback checks `obj._gen = gen` — if the generation doesn't match, the callback is stale and silently exits.
 
@@ -59,17 +87,17 @@ The 500ms interval is a balance: low enough that a lost message causes only a br
 
 `_complete := true` must be set **before** `SetTimer` in `_processData`. Setting it after creates a window where a stale callback can pass the `if this._complete` guard in `_onSignal` before the flag is raised, causing a duplicate `_drainRaw` call.
 
-### Sentinel (weak reference pattern)
+### Sentinel (StreamReader weak-reference pattern)
 
-**Problem:** The closure passed to `RegisterWaitForSingleObject` captures `ObjPtr(this)` — a raw pointer, not a reference. If the `StreamReader` is destroyed before the closure fires, `ObjFromPtrAddRef` would dereference a dangling pointer.
+**Problem:** The callback closure registered through `AsyncWait`, as well as the watchdog closure, captures `ObjPtr(this)` — a raw pointer, not a reference. If the `StreamReader` is destroyed before either closure runs, `ObjFromPtrAddRef` would dereference a dangling pointer.
 
-**Solution:** A separate `{alive: true}` object is captured alongside the raw pointer. `__Delete` sets `alive := false`. The closure checks `sentinel.alive` before attempting `ObjFromPtrAddRef`. The sentinel is a distinct object that remains valid even after the `StreamReader` is gone — its reference is held by the closure itself.
+**Solution:** A separate `{alive: true}` object is captured alongside the raw pointer. `__Delete` sets `alive := false`. Each closure checks `sentinel.alive` before attempting `ObjFromPtrAddRef`. The sentinel is a distinct object that remains valid even after the `StreamReader` is gone — its reference is held by the closure itself. This protects the lifetime of the higher-level `StreamReader`; the stable-ID registry described above independently protects `AsyncWait`'s own dispatch state.
 
 ### Why completionEvent = 0 (not -1) in _registerWait
 
-`RegisteredWait.Unregister()` calls `UnregisterWaitEx(wh, completionEvent)`. The default is `-1` (INVALID_HANDLE_VALUE), which blocks until the callback completes — safe in general use. But `_registerWait` passes `completionEvent=0` (NULL) for non-blocking unregistration. This is necessary because the old `RegisteredWait` is destroyed inside `_registerWait` (overwritten by the new one), which is itself called from `_onSignal` — blocking here would deadlock if the thread-pool callback hasn't returned yet.
+`RegisteredWait.Unregister()` calls `UnregisterWaitEx(wh, completionEvent)`. The default is `-1` (INVALID_HANDLE_VALUE), which blocks until the callback completes. `_registerWait` keeps `completionEvent=0` (NULL) so replacing an I/O wait does not block the GUI thread waiting for a native thread-pool callback to return.
 
-The generation counter protects against the resulting race condition (stale callback arriving after the new wait is registered).
+Registration IDs discard messages for canceled waits, and the generation counter rejects stale reader callbacks after the new wait is registered.
 
 For standalone use of `AsyncWait`, the default `-1` is safer and should be preferred.
 
@@ -113,6 +141,35 @@ When the stream completes (pipe closed), `_flushCarry` decodes any remaining car
 
 ## Two-phase cleanup
 
+### Weak references from readers to their owner
+
+Binding `_streamCallback` directly to an `AsyncProcessIO` instance creates a
+reference cycle: owner -> reader -> bound callback -> owner. Releasing the last
+external reference then never calls `__Delete`, retaining pipes, events and
+reader buffers. The regression test reproduced seven retained handles per process.
+
+Readers now bind to the static `_DispatchStream` method with a shared
+`{ptr: ObjPtr(owner)}` record, which does not retain the owner.
+`AsyncProcessIO.__Delete` clears the pointer before its first message-pumping
+operation, so queued data, EOF and timeout callbacks safely become no-ops.
+The dispatcher checks the pointer and acquires a temporary strong reference in
+one short critical section. It restores the previous Critical setting before
+calling the instance method, and retains that reference until the call returns.
+This keeps active dispatch safe without a persistent ownership cycle.
+
+Callers retain their process object while they need it. Releasing the last
+reference now reaches the existing cleanup path, including termination of a
+pending child. Callback signatures remain unchanged.
+
+The parent retains the child process handle until cleanup. `exitCode` returns
+the Windows exit code after the child exits, or an empty string while it is
+running. Cleanup terminates through that handle, avoiding PID reuse races.
+
+The silence timer is shared by stdout and stderr: output on either stream
+resets the clock. Once the deadline expires, the waiting stream reports
+`state=-1` even if the other stream is still open. Re-registering while
+the peer remained open previously postponed the timeout indefinitely.
+
 ### The problem
 
 `AsyncProcessIO` owns two `StreamReader`s (stdout + stderr). Each has a pending `RegisterWaitForSingleObject` and possibly in-flight `PostMessageW` messages. Cleaning up one at a time with `Sleep 50` each would take 100ms minimum.
@@ -120,12 +177,16 @@ When the stream completes (pipe closed), `_flushCarry` decodes any remaining car
 ### The solution
 
 1. `prepareDelete()` on both: poison sentinel, cancel IO, signal events.
-2. `Sleep 50` once: let any in-flight PostMessageW arrive; sentinel prevents execution.
-3. `finishDelete()` on both: `Unregister()` the thread-pool waits.
+2. `Sleep 50` once: let in-flight callbacks and `PostMessageW` messages settle; the poisoned sentinel makes their AHK closures no-ops.
+3. `finishDelete()` on both: `Unregister()` the thread-pool waits and remove their IDs from `AsyncWait`; any later messages are ignored.
 
 `AsyncStdinReader` has only one `StreamReader`, so it uses `prepareDelete` + `Sleep 50` + `finishDelete` directly.
 
 `StreamReader.__Delete` handles the standalone case: if `prepareDelete` wasn't called (no coordinated cleanup), it runs the full sequence itself.
+
+The regression test `tests/AsyncProcessIOLifetimeTest.ahk` checks normal output
+in both modes, completed and pending process destruction, retained handle counts,
+callbacks during/after owner cleanup, and wait registration/cancellation behavior.
 
 ## stdinOverlapped — AsyncStdinReader compatibility
 

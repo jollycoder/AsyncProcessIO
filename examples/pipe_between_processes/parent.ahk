@@ -3,7 +3,7 @@
 
 ; Spawn a child AHK process that will display incoming stdin in a GUI window.
 ; stdinOverlapped := true is required for AsyncStdinReader on the child side.
-childProc := AsyncProcessIO(A_AhkPath ' "' A_ScriptDir '\child.ahk" fromParent',,,,, true)
+childProc := AsyncProcessIO('"' A_AhkPath '" "' A_ScriptDir '\child.ahk" fromParent',,,,, true)
 
 ; Give the child process time to initialize its GUI before we start sending data.
 Sleep 1000
@@ -11,7 +11,7 @@ Sleep 1000
 ; Spawn a second process and pipe its stdout directly into the child's stdin.
 ; This demonstrates using two AsyncProcessIO instances simultaneously and
 ; forwarding output from one process to the input of another.
-dirProc := AsyncProcessIO('cmd /c dir /s C:\Windows\System32', OnDirOutput)
+dirProc := AsyncProcessIO('cmd /c dir /s ' Chr(34) A_WinDir '\System32' Chr(34), OnDirOutput)
 
 OnDirOutput(pid, str, state, stream) {
     global childProc, dirProc

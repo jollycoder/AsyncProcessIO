@@ -7,13 +7,17 @@ proc := AsyncProcessIO('powershell -Command Get-Process | Select-Object Name, Id
 OnData(PID, str, state, stream) {
     global proc
     static prevState := ''
+    static eofReceived := [false, false]
     ; defer to avoid re-entrancy
     SetTimer () => out.Append(str, stream), -1
     if state != prevState {
         prevState := state
         SetTimer () => out.SetState(state), -1
     }
-    if proc && state {
+    ; Keep the owner until both EOF callbacks have delivered their final data.
+    if state = 1
+        eofReceived[stream + 1] := true
+    if proc && eofReceived[1] && eofReceived[2] {
         proc := ''
     }
 }
@@ -29,6 +33,8 @@ class OutputGui
 
     Append(str, stream) {
         (!this.visible) && (this.visible := true, this.gui.Show())
+        ; Windows Edit controls break lines only on CRLF; normalize LF -> CRLF
+        str := RegExReplace(str, '\R', '`r`n')
         ctrl := stream = 0 ? 'out' : 'err'
         SendMessage 0xB1, -2, -1, this.%ctrl% ; EM_SETSEL
         EditPaste str, this.%ctrl%

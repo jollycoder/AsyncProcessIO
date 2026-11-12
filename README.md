@@ -133,7 +133,7 @@ stdout.Close()
 
 ### Timeout
 
-The timeout is a shared silence timer across both stdout and stderr. It fires if neither stream delivers data for the specified number of milliseconds.
+The timeout is a shared silence timer across both stdout and stderr. Data on either stream resets it. Once the deadline expires, a waiting stream reports state = -1 even while the other stream remains open.
 
 ```ahk
 #Requires AutoHotkey v2
@@ -219,6 +219,7 @@ callback(pid, data, state, stream)
 | Property | Description |
 |----------|-------------|
 | `proc.processID` | Child process ID |
+| `proc.exitCode` | Windows exit code after the child exits; empty string while it is still running |
 | `proc.complete` | `true` when both stdout and stderr are fully drained |
 | `proc.state` | Aggregate completion state: `0` running, `1` both streams reached EOF, `-1` at least one timed out |
 | `proc.outState` | stdout completion state: `0` running, `1` EOF, `-1` timed out |
@@ -235,6 +236,26 @@ proc.WriteText(str)        ; write a string to stdin; returns bytes written
 proc.WriteData(buf, size?) ; write raw bytes to stdin; returns bytes written
 proc.CloseStdIn()          ; close stdin write end, sending EOF to child
 ```
+
+### Object lifetime and cleanup
+
+Keep a reference to the `AsyncProcessIO` instance for as long as you need the
+operation or its accumulated output. Releasing the last reference runs cleanup:
+pending reads and waits are canceled, pipe/event handles are closed, and a child
+that is still running is terminated. An in-flight internal dispatcher holds a
+temporary reference until that dispatch returns.
+
+Internal stream callbacks hold a guarded weak reference to their owner, so
+completed operations no longer form a reference cycle. Queued internal callbacks
+become no-ops after cleanup starts. User callbacks can still create their own
+cycles if they capture an object that owns the process; avoid that ownership
+pattern.
+
+In callback mode, keep the process until your handler has consumed EOF
+(`state = 1`) for **both** stream IDs. One stream's EOF is not the end of the
+other stream, and `proc.complete` describes the pipe readers; callback timers
+may still be queued. In accumulation mode, `proc.state = 1` indicates that both
+EOF deliveries have been accumulated.
 
 ---
 
@@ -291,9 +312,31 @@ AsyncWait.Register(handle, callback, flags?, timeout?, completionEvent?)
 | `timeout` | `-1` (INFINITE) | Timeout in ms |
 | `completionEvent` | `-1` | `-1` blocks until callback completes; `0` returns immediately |
 
+`AsyncWait` keeps each registration alive internally. The caller does not have
+to retain the returned `RegisteredWait` for a one-shot wait, although retaining
+it is useful when the wait may need to be cancelled. Call `Unregister()` for a
+repeating wait when it is no longer needed. If a thread-pool callback has
+already posted its window message, `Unregister()` makes that delayed message a
+safe no-op; this also covers messages delivered after the computer resumes from
+sleep. The waitable handle itself remains owned by the caller.
+
+## Tests
+
+`tests/AsyncProcessIOLifetimeTest.ahk` is a self-contained regression test for
+object destruction, handle retention, pending-process cancellation, and late
+callbacks. It also covers replacement of active waits, one-shot and repeating
+waits, timeout delivery with both streams open, nonzero child exit codes, and stale notifications after cancellation.
+
+Run it with the x64 AutoHotkey v2 executable, using
+`/Validate /ErrorStdOut=UTF-8` first, then `/ErrorStdOut=UTF-8` for the runtime
+check. It creates only short-lived local test children, needs no network or GUI
+interaction, and has a 30-second safety timeout. Successful output ends with
+`[RESULT] passed=31 failed=0` and exit code 0; a failed assertion or unexpected
+runtime error exits with code 1, and the safety timeout exits with code 2.
+
 ## Architecture
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for a detailed explanation of the async mechanism, protective mechanisms (watchdog, generation counters, sentinel pattern), UTF-8 boundary fixing, memory management, and design decisions.
+See [ARCHITECTURE.md](ARCHITECTURE.md) for a detailed explanation of the async mechanism, protective mechanisms (stable registration IDs, watchdog, generation counters, sentinel pattern), UTF-8 boundary fixing, memory management, and design decisions.
 
 ## License
 

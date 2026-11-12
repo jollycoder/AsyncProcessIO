@@ -1,2 +1,6 @@
 *test*
 old*
+
+# Keep the documented regression suite under version control.
+!/tests/
+!/tests/**
